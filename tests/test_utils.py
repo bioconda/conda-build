@@ -1,12 +1,10 @@
 import unittest
-import tempfile
-import shutil
 import os
+import sys
 
 import pytest
 
 import conda_build.utils as utils
-from .utils import test_config, testing_workdir
 
 
 def makefile(name, contents=""):
@@ -20,18 +18,26 @@ def makefile(name, contents=""):
         f.write(contents)
 
 
-@pytest.fixture(scope='function')
-def namespace_setup(testing_workdir, request):
-    namespace = os.path.join(testing_workdir, 'namespace')
-    package = os.path.join(namespace, 'package')
-    makefile(os.path.join(package, "module.py"))
-    return testing_workdir
+@pytest.mark.skipif(utils.on_win, reason="only unix has python version in site-packages path")
+def test_get_site_packages():
+    # https://github.com/conda/conda-build/issues/1055#issuecomment-250961576
+    # crazy unreal python version that should show up in a second
+    crazy_path = os.path.join('/dummy', 'lib', 'python8.2', 'site-packages')
+    site_packages = utils.get_site_packages('/dummy', '8.2')
+    assert site_packages == crazy_path
+
+
+def test_prepend_sys_path():
+    path = sys.path[:]
+    with utils.sys_path_prepended(sys.prefix):
+        assert sys.path != path
+        assert sys.path[1].startswith(sys.prefix)
 
 
 def test_copy_source_tree(namespace_setup):
     dst = os.path.join(namespace_setup, 'dest')
-    utils.copy_into(namespace_setup, dst)
-    assert os.path.isfile(os.path.join(dst, 'namespace', 'package', 'module.py'))
+    utils.copy_into(os.path.join(namespace_setup, 'namespace'), dst)
+    assert os.path.isfile(os.path.join(dst, 'package', 'module.py'))
 
 
 def test_merge_namespace_trees(namespace_setup):
@@ -44,12 +50,27 @@ def test_merge_namespace_trees(namespace_setup):
     assert os.path.isfile(dep)
 
 
-def test_disallow_merge_conflicts(namespace_setup, test_config):
+@pytest.fixture(scope='function')
+def namespace_setup(testing_workdir, request):
+    namespace = os.path.join(testing_workdir, 'namespace')
+    package = os.path.join(namespace, 'package')
+    makefile(os.path.join(package, "module.py"))
+    return testing_workdir
+
+
+def test_disallow_merge_conflicts(namespace_setup, testing_config):
     duplicate = os.path.join(namespace_setup, 'dupe', 'namespace', 'package', 'module.py')
     makefile(duplicate)
     with pytest.raises(IOError):
         utils.merge_tree(os.path.dirname(duplicate), os.path.join(namespace_setup, 'namespace',
                                                  'package'))
+
+
+def test_disallow_in_tree_merge(testing_workdir):
+    with open('testfile', 'w') as f:
+        f.write("test")
+    with pytest.raises(AssertionError):
+        utils.merge_tree(testing_workdir, os.path.join(testing_workdir, 'subdir'))
 
 
 class TestUtils(unittest.TestCase):
@@ -137,3 +158,25 @@ class TestUtils(unittest.TestCase):
                 ('x/x/x/x/libhdf5.so', '../../../../a/b/c/d'),
         ]:
             self.assertEqual(utils.relative(f, 'a/b/c/d'), r)
+
+
+def test_expand_globs(testing_workdir):
+    files = ['abc', 'acb']
+    for f in files:
+        with open(f, 'w') as _f:
+            _f.write('weee')
+    assert utils.expand_globs(files, testing_workdir) == files
+    assert utils.expand_globs(['a*'], testing_workdir) == files
+
+
+def test_filter_files():
+    # Files that should be filtered out.
+    files_list = ['.git/a', 'something/.git/a', '.git\\a', 'something\\.git\\a']
+    assert not utils.filter_files(files_list, '')
+
+    # Files that should *not* be filtered out.
+    # Example of valid 'x.git' directory:
+    #    lib/python3.4/site-packages/craftr/stl/craftr.utils.git/Craftrfile
+    files_list = ['a', 'x.git/a', 'something/x.git/a',
+                  'x.git\\a', 'something\\x.git\\a']
+    assert len(utils.filter_files(files_list, '')) == len(files_list)

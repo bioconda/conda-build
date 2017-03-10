@@ -48,3 +48,30 @@ class UnableToParseMissingJinja2(UnableToParse):
 
 class UnableToParseMissingSetuptoolsDependencies(CondaBuildException):
     pass
+
+
+class VerifyError(CondaBuildException):
+    def __init__(self, error, script, *args):
+        self.error = error
+        self.script = script
+        self.msg = "%s failed to verify\n%s" % (script, error)
+        super(VerifyError, self).__init__(self.msg)
+
+
+class DependencyNeedsBuildingError(CondaBuildException):
+    def __init__(self, conda_exception=None, packages=None, *args, **kwargs):
+        if packages:
+            self.message = "Unsatisfiable dependencies: {}".format(packages)
+            self.packages = packages
+        else:
+            self.packages = packages or []
+            for line in str(conda_exception).splitlines():
+                if not line.startswith('  - '):
+                    continue
+                pkg = line.lstrip('  - ').split(' -> ')[-1]
+                pkg = pkg.strip().split(' ')[0]
+                self.packages.append(pkg)
+            self.message = str(conda_exception)
+        if not self.packages:
+            raise RuntimeError("failed to parse packages from exception:"
+                               " {}".format(str(conda_exception)))

@@ -22,19 +22,26 @@ requirements:
   build:
     - python
   run:
+    - beautifulsoup4
+    - chardet
     - conda  >=4.1
+    - contextlib2   # [py<34]
+    - conda-verify
+    - enum34        # [py<34]
     - filelock
+    - futures       # [py<3]
     - jinja2
-    - patchelf      [linux]
+    - patchelf      # [linux]
+    - pkginfo
     - pycrypto
     - python
     - pyyaml
+    - six
 
 test:
   requires:
     - pytest
     - pytest-cov
-    - pytest-timeout
     # Optional: you can use pytest-xdist to run the tests in parallel
     # - pytest-env  # [win]
     # - pytest-xdist
@@ -75,6 +82,10 @@ test:
     - conda_build
   source_files:
     - tests
+
+outputs:
+  - type: wheel
+  - name: {{ PKG_NAME }}
 
 about:
   home: https://github.com/conda/conda-build

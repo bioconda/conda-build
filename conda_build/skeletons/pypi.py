@@ -16,6 +16,7 @@ import subprocess
 import sys
 from tempfile import mkdtemp
 
+import pkginfo
 import requests
 from requests.packages.urllib3.util.url import parse_url
 import yaml
@@ -28,11 +29,12 @@ from conda_build.conda_interface import normalized_version
 from conda_build.conda_interface import human_bytes, hashsum_file
 from conda_build.conda_interface import default_python
 
-from conda_build.utils import tar_xf, unzip, rm_rf, guess_license_family
+from conda_build.utils import tar_xf, unzip, rm_rf, check_call_env
 from conda_build.source import apply_patch
-from conda_build.build import create_env
+from conda_build.environ import create_env
 from conda_build.config import Config
-from conda_build.metadata import MetaData, allowed_license_families
+from conda_build.metadata import MetaData
+from conda_build.license_family import allowed_license_families, guess_license_family
 
 if PY3:
     try:
@@ -135,6 +137,7 @@ class PyPIPackagesCompleter(Completer):
         args = self.parsed_args
         client = get_xmlrpc_client(getattr(args, 'pypi_url'))
         return [i.lower() for i in client.list_packages()]
+
 
 pypi_example = """
 Examples:
@@ -300,6 +303,7 @@ def skeletonize(packages, output_dir=".", version=None, recursive=False,
                 all_urls=False, pypi_url='https://pypi.python.org/pypi', noprompt=False,
                 version_compare=False, python_version=default_python, manual_url=False,
                 all_extras=False, noarch_python=False, config=None, setup_options=None,
+                extra_specs=[],
                 pin_numpy=False):
     client = get_xmlrpc_client(pypi_url)
     package_dicts = {}
@@ -357,7 +361,19 @@ def skeletonize(packages, output_dir=".", version=None, recursive=False,
         if is_url:
             d['version'] = 'UNKNOWN'
         else:
-            versions = sorted(client.package_releases(package, True), key=parse_version)
+            # need to treat hidden and visible packages separately.
+            # the behavior of PyPI XML API differs from the documentation in certain
+            # cases. See
+            # https://github.com/pypa/pypi-legacy/issues/189#issuecomment-275515861
+
+            sort_by_version = lambda l: sorted(l, key=parse_version)
+
+            hidden_versions = sort_by_version(client.package_releases(package, True))
+            visible_versions = sort_by_version(client.package_releases(package, False))
+
+            # this list of available versions is the union of hidden and visible ones.
+            versions = sort_by_version(set(hidden_versions + visible_versions))
+
             if version_compare:
                 version_compare(versions)
             if version:
@@ -366,7 +382,8 @@ def skeletonize(packages, output_dir=".", version=None, recursive=False,
                              % (version, package))
                 d['version'] = version
             else:
-                if not versions:
+                # select the most visible version from PyPI.
+                if not visible_versions:
                     # The xmlrpc interface is case sensitive, but the index itself
                     # is apparently not (the last time I checked,
                     # len(set(all_packages_lower)) == len(set(all_packages)))
@@ -378,14 +395,14 @@ def skeletonize(packages, output_dir=".", version=None, recursive=False,
                             del package_dicts[package]
                             continue
                     sys.exit("Error: Could not find any versions of package %s" % package)
-                if len(versions) > 1:
+                if len(visible_versions) > 1:
                     print("Warning, the following versions were found for %s" %
                           package)
-                    for ver in versions:
+                    for ver in visible_versions:
                         print(ver)
-                    print("Using %s" % versions[-1])
+                    print("Using %s" % visible_versions[-1])
                     print("Use --version to specify a different version.")
-                d['version'] = versions[-1]
+                d['version'] = visible_versions[-1]
 
         data, d['pypiurl'], d['filename'], d['md5'] = get_download_data(client,
                                                                         package,
@@ -402,7 +419,8 @@ def skeletonize(packages, output_dir=".", version=None, recursive=False,
 
         get_package_metadata(package, d, data, output_dir, python_version,
                              all_extras, recursive, created_recipes, noarch_python,
-                             noprompt, packages, config=config, setup_options=setup_options)
+                             noprompt, packages, extra_specs, config=config,
+                             setup_options=setup_options)
 
         if d['import_tests'] == '':
             d['import_comment'] = '# '
@@ -471,7 +489,8 @@ def add_parser(repos):
     )
     pypi.add_argument(
         "--version",
-        help="Version to use. Applies to all packages.",
+        help="""Version to use. Applies to all packages. If not specified the
+              lastest visible version on PyPI is used.""",
     )
     pypi.add_argument(
         "--all-urls",
@@ -506,8 +525,8 @@ def add_parser(repos):
     pypi.add_argument(
         "--version-compare",
         action='store_true',
-        help="""Compare the package version of the recipe with the one available
-        on PyPI."""
+        help="""Compare the package version of the recipe with all available
+        versions on PyPI."""
     )
     pypi.add_argument(
         "--python-version",
@@ -530,6 +549,32 @@ def add_parser(repos):
         action='store_true',
         default=False,
         help="Creates recipe as noarch python"
+    )
+
+    pypi.add_argument(
+        "--setup-options",
+        action='append',
+        default=[],
+        help='Options to be added to setup.py install in the recipe. '
+             'The same options are passed to setup.py install in both '
+             'the construction of the recipe and in the recipe itself.'
+             'For options that include a double-hypen or to pass multiple '
+             'options, use the syntax '
+             '--setup-options="--option1 --option-with-arg arg"'
+    )
+
+    pypi.add_argument(
+        "--pin-numpy",
+        action='store_true',
+        help="Ensure that the generated recipe pins the version of numpy"
+             "to CONDA_NPY."
+    )
+
+    pypi.add_argument(
+        "--extra-specs",
+        action='append',
+        default=[],
+        help="Extra specs for the build environment to extract the skeleton.",
     )
 
 
@@ -631,7 +676,7 @@ def version_compare(package, versions):
 
 def get_package_metadata(package, d, data, output_dir, python_version, all_extras,
                          recursive, created_recipes, noarch_python, noprompt, packages,
-                         config, setup_options):
+                         extra_specs, config, setup_options):
 
     print("Downloading %s" % package)
 
@@ -640,15 +685,16 @@ def get_package_metadata(package, d, data, output_dir, python_version, all_extra
                           pypiurl=d['pypiurl'],
                           md5=d['md5'],
                           python_version=python_version,
+                          extra_specs=extra_specs,
                           setup_options=setup_options,
                           config=config)
 
-    setuptools_build = pkginfo['setuptools']
+    setuptools_build = pkginfo.get('setuptools', False)
     setuptools_run = False
 
     # Look at the entry_points and construct console_script and
     #  gui_scripts entry_points for conda
-    entry_points = pkginfo['entry_points']
+    entry_points = pkginfo.get('entry_points', [])
     if entry_points:
         if isinstance(entry_points, str):
             # makes sure it is left-shifted
@@ -665,10 +711,10 @@ def get_package_metadata(package, d, data, output_dir, python_version, all_extra
                 entry_points = pkginfo['entry_points']
             else:
                 setuptools_run = True
-                for section in config.sections():
+                for section in _config.sections():
                     if section in ['console_scripts', 'gui_scripts']:
                         value = ['%s=%s' % (option, _config.get(section, option))
-                                    for option in config.options(section)]
+                                    for option in _config.options(section)]
                         entry_points[section] = value
         if not isinstance(entry_points, dict):
             print("WARNING: Could not add entry points. They were:")
@@ -741,7 +787,7 @@ def get_package_metadata(package, d, data, output_dir, python_version, all_extra
     if d['version'] == 'UNKNOWN':
         d['version'] = pkginfo['version']
 
-    if pkginfo['packages']:
+    if pkginfo.get('packages'):
         deps = set(pkginfo['packages'])
         if d['import_tests']:
             if not d['import_tests'] or d['import_tests'] == 'PLACEHOLDER':
@@ -756,7 +802,7 @@ def get_package_metadata(package, d, data, output_dir, python_version, all_extra
         d['tests_require'] = INDENT.join(sorted([spec_from_line(pkg) for pkg
                                                     in pkginfo['tests_require']]))
 
-    if pkginfo['homeurl'] is not None:
+    if pkginfo.get('homeurl'):
         d['homeurl'] = pkginfo['homeurl']
     else:
         if data and 'homeurl' in data:
@@ -765,7 +811,7 @@ def get_package_metadata(package, d, data, output_dir, python_version, all_extra
             d['homeurl'] = "The package home page"
             d['home_comment'] = '#'
 
-    if pkginfo['summary']:
+    if pkginfo.get('summary'):
         d['summary'] = repr(pkginfo['summary'])
     else:
         if data:
@@ -777,7 +823,7 @@ def get_package_metadata(package, d, data, output_dir, python_version, all_extra
         d['summary'] = d['summary'][1:]
 
     license_classifier = "License :: OSI Approved :: "
-    if pkginfo['classifiers']:
+    if pkginfo.get('classifiers'):
         licenses = [classifier.split(license_classifier, 1)[1] for
             classifier in pkginfo['classifiers'] if classifier.startswith(license_classifier)]
     elif data and 'classifiers' in data:
@@ -786,7 +832,7 @@ def get_package_metadata(package, d, data, output_dir, python_version, all_extra
     else:
         licenses = []
     if not licenses:
-        if pkginfo['license']:
+        if pkginfo.get('license'):
             license_name = pkginfo['license']
         elif data and 'license' in data:
             license_name = data['license']
@@ -865,7 +911,7 @@ def get_requirements(package, pkginfo, all_extras=True):
 
     # ... and collect all needed requirement specs in a single list:
     requires = []
-    for specs in [pkginfo['install_requires']] + extras_require:
+    for specs in [pkginfo.get('install_requires', "")] + extras_require:
         if isinstance(specs, string_types):
             requires.append(specs)
         else:
@@ -874,7 +920,8 @@ def get_requirements(package, pkginfo, all_extras=True):
     return requires
 
 
-def get_pkginfo(package, filename, pypiurl, md5, python_version, config, setup_options):
+def get_pkginfo(package, filename, pypiurl, md5, python_version, extra_specs, config,
+                setup_options):
     # Unfortunately, two important pieces of metadata are only stored in
     # the package itself: the dependencies, and the entry points (if the
     # package uses distribute).  Our strategy is to download the package
@@ -901,16 +948,20 @@ def get_pkginfo(package, filename, pypiurl, md5, python_version, config, setup_o
         print("working in %s" % tempdir)
         src_dir = get_dir(tempdir)
         # TODO: find args parameters needed by run_setuppy
-        run_setuppy(src_dir, tempdir, python_version, config=config, setup_options=setup_options)
-        with open(join(tempdir, 'pkginfo.yaml')) as fn:
-            pkginfo = yaml.load(fn)
+        run_setuppy(src_dir, tempdir, python_version, extra_specs=extra_specs, config=config,
+                    setup_options=setup_options)
+        try:
+            with open(join(tempdir, 'pkginfo.yaml')) as fn:
+                pkg_info = yaml.load(fn)
+        except IOError:
+            pkg_info = pkginfo.SDist(download_path).__dict__
     finally:
         rm_rf(tempdir)
 
-    return pkginfo
+    return pkg_info
 
 
-def run_setuppy(src_dir, temp_dir, python_version, config, setup_options):
+def run_setuppy(src_dir, temp_dir, python_version, extra_specs, config, setup_options):
     '''
     Patch distutils and then run setup.py in a subprocess.
 
@@ -919,19 +970,28 @@ def run_setuppy(src_dir, temp_dir, python_version, config, setup_options):
     :param temp_dir: Temporary directory for doing for storing pkginfo.yaml
     :type temp_dir: str
     '''
-    specs = ['python %s*' % python_version, 'pyyaml', 'setuptools']
+    # TODO: we could make everyone's lives easier if we include packaging here, because setuptools
+    #    needs it in recent versions.  At time of writing, it is not a package in defaults, so this
+    #    actually breaks conda-build right now.  Omit it until packaging is on defaults.
+    # specs = ['python %s*' % python_version, 'pyyaml', 'setuptools', 'six', 'packaging', 'appdirs']
+    specs = ['python %s*' % python_version, 'pyyaml']
     with open(os.path.join(src_dir, "setup.py")) as setup:
         text = setup.read()
         if 'import numpy' in text or 'from numpy' in text:
             specs.append('numpy')
+
+    specs.extend(extra_specs)
+
     # Do everything in the build env in case the setup.py install goes
     # haywire.
     # TODO: Try with another version of Python if this one fails. Some
     # packages are Python 2 or Python 3 only.
 
-    create_env(config.build_prefix, specs=specs,
-               clear_cache=False,
-               config=config)
+    if not os.path.isdir(config.build_prefix) or not os.listdir(config.build_prefix):
+        create_env(config.build_prefix, specs=specs,
+                   subdir=config.build_subdir,
+                   clear_cache=False,
+                   config=config)
     stdlib_dir = join(config.build_prefix,
                       'Lib' if sys.platform == 'win32'
                       else 'lib/python%s' % python_version)
@@ -969,7 +1029,7 @@ def run_setuppy(src_dir, temp_dir, python_version, config, setup_options):
     cmdargs = [config.build_python, 'setup.py', 'install']
     cmdargs.extend(setup_options)
     try:
-        subprocess.check_call(cmdargs, env=env)
+        check_call_env(cmdargs, env=env)
     except subprocess.CalledProcessError:
         print('$PYTHONPATH = %s' % env['PYTHONPATH'])
         sys.exit('Error: command failed: %s' % ' '.join(cmdargs))

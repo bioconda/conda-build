@@ -2,6 +2,7 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from functools import partial
+import os
 from pkg_resources import parse_version
 
 import conda
@@ -14,22 +15,25 @@ from conda.compat import (PY3, StringIO, configparser, input, iteritems, lchmod,
                           text_type, TemporaryDirectory)  # NOQA
 from conda.connection import CondaSession  # NOQA
 from conda.fetch import TmpDownload, download, fetch_index, handle_proxy_407  # NOQA
-from conda.install import (delete_trash, is_linked, linked, linked_data, move_to_trash,  # NOQA
-                           prefix_placeholder, rm_rf, symlink_conda, rm_fetched, package_cache)  # NOQA
+from conda.install import (delete_trash, is_linked, linked, linked_data, prefix_placeholder,  # NOQA
+                           rm_rf, symlink_conda, rm_fetched, package_cache)  # NOQA
 from conda.lock import Locked  # NOQA
 from conda.misc import untracked, walk_prefix  # NOQA
 from conda.resolve import MatchSpec, NoPackagesFound, Resolve, Unsatisfiable, normalized_version  # NOQA
 from conda.signature import KEYS, KEYS_DIR, hash_file, verify  # NOQA
 from conda.utils import human_bytes, hashsum_file, md5_file, memoized, unix_path_to_win, win_path_to_unix, url_path  # NOQA
 import conda.config as cc  # NOQA
-from conda.config import sys_rc_path  # NOQA
+from conda.config import rc_path  # NOQA
 from conda.version import VersionOrder  # NOQA
+from enum import Enum
+
 
 if parse_version(conda.__version__) >= parse_version("4.2"):
     # conda 4.2.x
     import conda.base.context
     import conda.exceptions
     from conda.base.context import get_prefix as context_get_prefix, non_x86_linux_machines  # NOQA
+    from conda.models.channel import prioritize_channels
 
     from conda.base.constants import DEFAULT_CHANNELS  # NOQA
     get_prefix = partial(context_get_prefix, conda.base.context.context)
@@ -51,9 +55,24 @@ if parse_version(conda.__version__) >= parse_version("4.2"):
     get_local_urls = lambda: list(get_conda_build_local_url()) or []
     load_condarc = lambda fn: conda.base.context.reset_context([fn])
     PaddingError = conda.exceptions.PaddingError
+    LinkError = conda.exceptions.LinkError
+    NoPackagesFoundError = conda.exceptions.NoPackagesFoundError
+    CondaValueError = conda.exceptions.CondaValueError
+    LockError = conda.exceptions.LockError
+    CondaHTTPError = conda.exceptions.CondaHTTPError
+    PackageNotFoundError = conda.exceptions.PackageNotFoundError
+    UnsatisfiableError = conda.exceptions.UnsatisfiableError
+    CondaError = conda.exceptions.CondaError
+
+    # disallow softlinks.  This avoids a lot of dumb issues, at the potential cost of disk space.
+    conda.base.context.context.allow_softlinks = False
+
+    # when deactivating envs (e.g. switching from root to build/test) this env var is used,
+    # except the PR that removed this has been reverted (for now) and Windows doesnt need it.
+    env_path_backup_var_exists = os.environ.get('CONDA_PATH_BACKUP', None)
 
 else:
-    from conda.config import get_default_urls, non_x86_linux_machines, load_condarc  # NOQA
+    from conda.config import get_default_urls, non_x86_linux_machines, load_condarc, prioritize_channels  # NOQA
     from conda.cli.common import get_prefix  # NOQA
 
     arch_name = cc.arch_name
@@ -71,8 +90,36 @@ else:
     get_rc_urls = cc.get_rc_urls
     get_local_urls = cc.get_local_urls
 
+    cc.allow_softlinks = False
+
+    class CondaHTTPError(Exception):
+        pass
+
     class PaddingError(Exception):
         pass
+
+    class LockError(Exception):
+        pass
+
+    class LinkError(Exception):
+        pass
+
+    class NoPackagesFoundError(Exception):
+        pass
+
+    class PackageNotFoundError(Exception):
+        pass
+
+    class CondaValueError(Exception):
+        pass
+
+    class UnsatisfiableError(Exception):
+        pass
+
+    class CondaError(Exception):
+        pass
+
+    env_path_backup_var_exists = os.environ.get('CONDA_PATH_BACKUP', None)
 
 
 class SignatureError(Exception):
@@ -103,11 +150,168 @@ def which_prefix(path):
     """
     from os.path import abspath, join, isdir, dirname
     prefix = abspath(path)
-    while True:
+    iteration = 0
+    while iteration < 20:
         if isdir(join(prefix, 'conda-meta')):
             # we found the it, so let's return it
-            return prefix
+            break
         if prefix == dirname(prefix):
             # we cannot chop off any more directories, so we didn't find it
-            return None
+            prefix = None
+            break
         prefix = dirname(prefix)
+        iteration += 1
+    return prefix
+
+
+if parse_version(conda.__version__) >= parse_version("4.3"):
+    from conda.exports import FileMode, PathType
+    FileMode, PathType = FileMode, PathType
+    from conda.exports import EntityEncoder
+    EntityEncoder = EntityEncoder
+    from conda.exports import CrossPlatformStLink
+    CrossPlatformStLink = CrossPlatformStLink
+    from conda.exports import dist_str_in_index
+    from conda.models.dist import Dist
+    from conda.core.package_cache import ProgressiveFetchExtract
+else:
+    from json import JSONEncoder
+    from os import lstat
+    import os
+
+    dist_str_in_index = lambda index, dist_str: dist_str in index
+
+    class Dist(object):
+        pass
+
+    class ProgressiveFetchExtract(object):
+        pass
+
+    class PathType(Enum):
+        """
+        Refers to if the file in question is hard linked or soft linked. Originally designed to be
+        used in paths.json
+        """
+        hardlink = "hardlink"
+        softlink = "softlink"
+
+        def __str__(self):
+            return self.value
+
+        def __json__(self):
+            return self.name
+
+    class FileMode(Enum):
+        """
+        Refers to the mode of the file. Originally referring to the has_prefix file, but adopted
+        for paths.json
+        """
+        text = 'text'
+        binary = 'binary'
+
+        def __str__(self):
+            return "%s" % self.value
+
+    class EntityEncoder(JSONEncoder):
+        # json.dumps(obj, cls=SetEncoder)
+        def default(self, obj):
+            if hasattr(obj, 'dump'):
+                return obj.dump()
+            elif hasattr(obj, '__json__'):
+                return obj.__json__()
+            elif hasattr(obj, 'to_json'):
+                return obj.to_json()
+            elif hasattr(obj, 'as_json'):
+                return obj.as_json()
+            return JSONEncoder.default(self, obj)
+
+    # work-around for python bug on Windows prior to python 3.2
+    # https://bugs.python.org/issue10027
+    # Adapted from the ntfsutils package, Copyright (c) 2012, the Mozilla Foundation
+    class CrossPlatformStLink(object):
+        _st_nlink = None
+
+        def __call__(self, path):
+            return self.st_nlink(path)
+
+        @classmethod
+        def st_nlink(cls, path):
+            if cls._st_nlink is None:
+                cls._initialize()
+            return cls._st_nlink(path)
+
+        @classmethod
+        def _standard_st_nlink(cls, path):
+            return lstat(path).st_nlink
+
+        @classmethod
+        def _windows_st_nlink(cls, path):
+            st_nlink = cls._standard_st_nlink(path)
+            if st_nlink != 0:
+                return st_nlink
+            else:
+                # cannot trust python on Windows when st_nlink == 0
+                # get value using windows libraries to be sure of its true value
+                # Adapted from the ntfsutils package, Copyright (c) 2012, the Mozilla Foundation
+                GENERIC_READ = 0x80000000
+                FILE_SHARE_READ = 0x00000001
+                OPEN_EXISTING = 3
+                hfile = cls.CreateFile(path, GENERIC_READ, FILE_SHARE_READ, None,
+                                       OPEN_EXISTING, 0, None)
+                if hfile is None:
+                    from ctypes import WinError
+                    raise WinError(
+                        "Could not determine determine number of hardlinks for %s" % path)
+                info = cls.BY_HANDLE_FILE_INFORMATION()
+                rv = cls.GetFileInformationByHandle(hfile, info)
+                cls.CloseHandle(hfile)
+                if rv == 0:
+                    from ctypes import WinError
+                    raise WinError("Could not determine file information for %s" % path)
+                return info.nNumberOfLinks
+
+        @classmethod
+        def _initialize(cls):
+            if os.name != 'nt':
+                cls._st_nlink = cls._standard_st_nlink
+            else:
+                # http://msdn.microsoft.com/en-us/library/windows/desktop/aa363858
+                import ctypes
+                from ctypes import POINTER
+                from ctypes.wintypes import DWORD, HANDLE, BOOL
+
+                cls.CreateFile = ctypes.windll.kernel32.CreateFileW
+                cls.CreateFile.argtypes = [ctypes.c_wchar_p, DWORD, DWORD, ctypes.c_void_p,
+                                           DWORD, DWORD, HANDLE]
+                cls.CreateFile.restype = HANDLE
+
+                # http://msdn.microsoft.com/en-us/library/windows/desktop/ms724211
+                cls.CloseHandle = ctypes.windll.kernel32.CloseHandle
+                cls.CloseHandle.argtypes = [HANDLE]
+                cls.CloseHandle.restype = BOOL
+
+                class FILETIME(ctypes.Structure):
+                    _fields_ = [("dwLowDateTime", DWORD),
+                                ("dwHighDateTime", DWORD)]
+
+                class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+                    _fields_ = [("dwFileAttributes", DWORD),
+                                ("ftCreationTime", FILETIME),
+                                ("ftLastAccessTime", FILETIME),
+                                ("ftLastWriteTime", FILETIME),
+                                ("dwVolumeSerialNumber", DWORD),
+                                ("nFileSizeHigh", DWORD),
+                                ("nFileSizeLow", DWORD),
+                                ("nNumberOfLinks", DWORD),
+                                ("nFileIndexHigh", DWORD),
+                                ("nFileIndexLow", DWORD)]
+
+                cls.BY_HANDLE_FILE_INFORMATION = BY_HANDLE_FILE_INFORMATION
+
+                # http://msdn.microsoft.com/en-us/library/windows/desktop/aa364952
+                cls.GetFileInformationByHandle = ctypes.windll.kernel32.GetFileInformationByHandle
+                cls.GetFileInformationByHandle.argtypes = [HANDLE,
+                                                           POINTER(BY_HANDLE_FILE_INFORMATION)]
+                cls.GetFileInformationByHandle.restype = BOOL
+
+                cls._st_nlink = cls._windows_st_nlink

@@ -9,12 +9,6 @@ if sys.version_info[:2] < (2, 7):
     sys.exit("conda-build is only meant for Python >=2.7"
              "Current Python version: %d.%d" % sys.version_info[:2])
 
-versioneer.VCS = 'git'
-versioneer.versionfile_source = 'conda_build/_version.py'
-versioneer.versionfile_build = 'conda_build/_version.py'
-versioneer.tag_prefix = ''
-versioneer.parentdir_prefix = 'conda-build-'
-
 setup(
     name="conda-build",
     version=versioneer.get_version(),
@@ -48,7 +42,7 @@ setup(
                             'conda-sign = conda_build.cli.main_sign:main',
                             'conda-skeleton = conda_build.cli.main_skeleton:main',
                             ]},
-    install_requires=['conda'],
+    install_requires=['conda', 'requests', 'filelock'],
     package_data={'conda_build': ['templates/*', 'cli-*.exe']},
     zip_safe=False,
 )

@@ -13,7 +13,7 @@ import sys
 from .conda_interface import string_types
 
 from conda_build.post import mk_relative_osx
-from conda_build.utils import _check_call, rec_glob
+from conda_build.utils import check_call_env, rec_glob, get_site_packages
 from conda_build.os_utils.external import find_executable
 
 
@@ -62,22 +62,6 @@ def write_to_conda_pth(sp_dir, pkg_path):
             print("added " + pkg_path)
 
 
-def get_site_pkg(prefix, py_ver):
-    '''
-    Given the path to conda environment, find the site-packages directory
-
-    :param prefix: path to conda environment. Look here for current
-        environment's site-packages
-    :returns: absolute path to site-packages directory
-    '''
-    # get site-packages directory
-    stdlib_dir = join(prefix, 'Lib' if sys.platform == 'win32' else
-                      'lib/python%s' % py_ver)
-    sp_dir = join(stdlib_dir, 'site-packages')
-
-    return sp_dir
-
-
 def get_setup_py(path_):
     ''' Return full path to setup.py or exit if not found '''
     # build path points to source dir, builds are placed in the
@@ -98,7 +82,7 @@ def _clean(setup_py):
     '''
     # first call setup.py clean
     cmd = ['python', setup_py, 'clean']
-    _check_call(cmd)
+    check_call_env(cmd)
     print("Completed: " + " ".join(cmd))
     print("===============================================")
 
@@ -116,7 +100,7 @@ def _build_ext(setup_py):
 
     # next call setup.py develop
     cmd = ['python', setup_py, 'build_ext', '--inplace']
-    _check_call(cmd)
+    check_call_env(cmd)
     print("Completed: " + " ".join(cmd))
     print("===============================================")
 
@@ -162,8 +146,8 @@ Error: environment does not exist: %s
     assert find_executable('python', prefix=prefix)
 
     # current environment's site-packages directory
-    py_ver = '%d.%d' % (sys.version_info.major, sys.version_info.minor)
-    sp_dir = get_site_pkg(prefix, py_ver)
+    sp_dir = get_site_packages(prefix, '.'.join((str(sys.version_info.major),
+                                                 str(sys.version_info.minor))))
 
     if type(recipe_dirs) == string_types:
         recipe_dirs = [recipe_dirs]

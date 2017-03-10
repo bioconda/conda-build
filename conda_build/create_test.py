@@ -9,7 +9,7 @@ import os
 from os.path import join, exists, isdir
 import sys
 
-from conda_build.utils import copy_into, get_ext_files, on_win
+from conda_build.utils import copy_into, get_ext_files, on_win, ensure_list
 from conda_build import source
 
 
@@ -38,7 +38,7 @@ def call_args(string):
 '''
 
 
-def create_files(dir_path, m, config):
+def create_files(dir_path, m):
     """
     Create the test files for pkg in the directory given.  The resulting
     test files are configuration (i.e. platform, architecture, Python and
@@ -47,43 +47,53 @@ def create_files(dir_path, m, config):
     True if it has.
     """
     has_files = False
-    for fn in m.get_value('test/files', []):
+    for fn in ensure_list(m.get_value('test/files', [])):
         has_files = True
         path = join(m.path, fn)
-        copy_into(path, join(dir_path, fn), config.timeout)
+        copy_into(path, join(dir_path, fn), m.config.timeout, locking=m.config.locking)
     # need to re-download source in order to do tests
-    if m.get_value('test/source_files') and not isdir(config.work_dir):
-        source.provide(m.path, m.get_section('source'), config=config)
-    for pattern in m.get_value('test/source_files', []):
+    if m.get_value('test/source_files') and not isdir(m.config.work_dir):
+        source.provide(m)
+    for pattern in ensure_list(m.get_value('test/source_files', [])):
         if on_win and '\\' in pattern:
             raise RuntimeError("test/source_files paths must use / "
                                 "as the path delimiter on Windows")
         has_files = True
-        files = glob.glob(join(source.get_dir(config), pattern))
+        files = glob.glob(join(m.config.work_dir, pattern))
         if not files:
             raise RuntimeError("Did not find any source_files for test with pattern %s", pattern)
         for f in files:
-            copy_into(f, f.replace(source.get_dir(config), config.test_dir), config.timeout)
+            copy_into(f, f.replace(m.config.work_dir, m.config.test_dir), m.config.timeout,
+                      locking=m.config.locking)
         for ext in '.pyc', '.pyo':
-            for f in get_ext_files(config.test_dir, ext):
+            for f in get_ext_files(m.config.test_dir, ext):
                 os.remove(f)
     return has_files
 
 
-def create_shell_files(dir_path, m, config):
+def create_shell_files(dir_path, m):
     has_tests = False
-    if sys.platform == 'win32':
-        name = 'run_test.bat'
+    ext = '.bat' if sys.platform == 'win32' else '.sh'
+    name = 'no-file'
+
+    # the way this works is that each output needs to explicitly define a test script to run.
+    #   They do not automatically pick up run_test.*, but can be pointed at that explicitly.
+    for out in m.meta.get('outputs', []):
+        if m.name() == out.get('name'):
+            out_test_script = out.get('test', {}).get('script', 'no-file')
+            if os.path.splitext(out_test_script)[1].lower() == ext:
+                name = out_test_script
+                break
     else:
-        name = 'run_test.sh'
+        name = "run_test{}".format(ext)
 
     if exists(join(m.path, name)):
-        copy_into(join(m.path, name), dir_path, config.timeout)
+        copy_into(join(m.path, name), dir_path, m.config.timeout, locking=m.config.locking)
         has_tests = True
 
     with open(join(dir_path, name), 'a') as f:
         f.write('\n\n')
-        for cmd in m.get_value('test/commands', []):
+        for cmd in ensure_list(m.get_value('test/commands', [])):
             f.write(cmd)
             f.write('\n')
             if sys.platform == 'win32':
@@ -100,14 +110,22 @@ def create_py_files(dir_path, m):
         fo.write(header + '\n')
         fo.write("print('===== testing package: %s =====')\n" % m.dist())
 
-        for name in m.get_value('test/imports', []):
+        for name in ensure_list(m.get_value('test/imports', [])):
             fo.write('print("import: %r")\n' % name)
             fo.write('import %s\n' % name)
             fo.write('\n')
             has_tests = True
 
         try:
-            with open(join(m.path, 'run_test.py')) as fi:
+            name = 'run_test.py'
+            # the way this works is that each output needs to explicitly define a test script to run
+            #   They do not automatically pick up run_test.*, but can be pointed at that explicitly.
+            for out in m.meta.get('outputs', []):
+                if m.name() == out.get('name'):
+                    out_test_script = out.get('test', {}).get('script', 'no-file')
+                    name = out_test_script if out_test_script.endswith('.py') else 'no-file'
+
+            with open(join(m.path, name)) as fi:
                 fo.write("print('running run_test.py')\n")
                 fo.write("# --- run_test.py (begin) ---\n")
                 fo.write(fi.read())
@@ -146,7 +164,15 @@ def create_pl_files(dir_path, m):
             has_tests = True
 
         try:
-            with open(join(m.path, 'run_test.pl')) as fi:
+            name = 'run_test.pl'
+
+            # the way this works is that each output needs to explicitly define a test script to run
+            #   They do not automatically pick up run_test.*, but can be pointed at that explicitly.
+            for out in m.meta.get('outputs', []):
+                if m.name() == out['name']:
+                    out_test_script = out.get('test', {}).get('script', 'no-file')
+                    name = out_test_script if out_test_script.endswith('.pl') else 'no-file'
+            with open(join(m.path, name)) as fi:
                 print("# --- run_test.pl (begin) ---", file=fo)
                 fo.write(fi.read())
                 print("# --- run_test.pl (end) ---", file=fo)
